@@ -1,5 +1,5 @@
 // Cloudflare Workers handler for personalized feed
-import { connect } from '@planetscale/database';
+import mysql from 'mysql2';
 
 const setCorsHeaders = (request) => {
   const headers = new Headers();
@@ -26,12 +26,19 @@ export default {
     }
 
     try {
-      const db = connect({
-        host: env.DB_HOST,
-        username: env.DB_USER,
-        password: env.DB_PASSWORD,
-        database: env.DB_NAME
+      // Create MySQL connection pool
+      const pool = mysql.createPool({
+        host: 'srv787.hstgr.io',
+        user: 'u208245805_Crypto21',
+        password: 'Crypto21@',
+        database: 'u208245805_Crypto21',
+        waitForConnections: true,
+        connectionLimit: 100,
+        queueLimit: 0
       });
+      
+      // Get promise-based pool for async/await
+      const db = pool.promise();
 
       const defaultPfp = 'https://latestnewsandaffairs.site/public/pfp.jpg';
       const url = new URL(request.url);
@@ -63,7 +70,7 @@ export default {
 
     } catch (error) {
       console.error('Feed handler error:', error);
-      return new Response(JSON.stringify({ error: 'Internal server error' }), {
+      return new Response(JSON.stringify({ error: 'Internal server error', details: error.message }), {
         status: 500,
         headers: { ...Object.fromEntries(headers), 'Content-Type': 'application/json' }
       });
@@ -108,7 +115,7 @@ async function handlePersonalizedFeed(db, userId, page, limit, headers, defaultP
 
   } catch (error) {
     console.error('❌ Error in personalized feed:', error);
-    return new Response(JSON.stringify({ error: 'Failed to generate personalized feed' }), {
+    return new Response(JSON.stringify({ error: 'Failed to generate personalized feed', details: error.message }), {
       status: 500,
       headers: { ...Object.fromEntries(headers), 'Content-Type': 'application/json' }
     });
@@ -119,16 +126,16 @@ async function handlePersonalizedFeed(db, userId, page, limit, headers, defaultP
 async function getUserDataAndRelationships(db, userId) {
   try {
     // Get user basic info and location
-    const userResult = await db.execute(
+    const [userRows] = await db.execute(
       'SELECT username, city, region, country FROM users WHERE username = ?',
       [userId]
     );
 
-    if (userResult.rows.length === 0) return null;
-    const user = userResult.rows[0];
+    if (userRows.length === 0) return null;
+    const user = userRows[0];
 
     // Get friends (accepted relationships)
-    const friendsResult = await db.execute(`
+    const [friendsRows] = await db.execute(`
       SELECT CASE 
         WHEN follower = ? THEN following 
         ELSE follower 
@@ -139,7 +146,7 @@ async function getUserDataAndRelationships(db, userId) {
     `, [userId, userId, userId]);
 
     // Get following (one-way follows)
-    const followingResult = await db.execute(`
+    const [followingRows] = await db.execute(`
       SELECT following as following_username
       FROM follows 
       WHERE follower = ? AND relationship_status = 'none'
@@ -147,8 +154,8 @@ async function getUserDataAndRelationships(db, userId) {
 
     return {
       ...user,
-      friends: friendsResult.rows.map(row => row.friend_username),
-      following: followingResult.rows.map(row => row.following_username)
+      friends: friendsRows.map(row => row.friend_username),
+      following: followingRows.map(row => row.following_username)
     };
 
   } catch (error) {
@@ -160,7 +167,7 @@ async function getUserDataAndRelationships(db, userId) {
 // === RECENTLY VIEWED POSTS ===
 async function getRecentlyViewedPosts(db, userId) {
   try {
-    const viewedResult = await db.execute(`
+    const [rows] = await db.execute(`
       SELECT post_id 
       FROM post_views 
       WHERE user_id = ? 
@@ -169,7 +176,7 @@ async function getRecentlyViewedPosts(db, userId) {
       LIMIT 1000
     `, [userId]);
 
-    return new Set(viewedResult.rows.map(row => row.post_id));
+    return new Set(rows.map(row => row.post_id));
   } catch (error) {
     console.error('Error getting viewed posts:', error);
     return new Set(); // Return empty set on error
@@ -230,19 +237,30 @@ async function generateFeedComposition(db, userData, recentlyViewed, limit) {
 async function getRandomPosts(db, userData, recentlyViewed, count) {
   if (count <= 0) return [];
   
-  const viewedFilter = recentlyViewed.size > 0 
-    ? `AND p._id NOT IN (${Array.from(recentlyViewed).map(() => '?').join(',')})` 
-    : '';
-  
-  const result = await db.execute(`
-    SELECT p.* FROM posts p
-    WHERE p.timestamp > DATE_SUB(NOW(), INTERVAL 7 DAY)
-    ${viewedFilter}
-    ORDER BY RAND()
-    LIMIT ?
-  `, [...Array.from(recentlyViewed), count]);
+  try {
+    const viewedArray = Array.from(recentlyViewed);
+    let sql = `
+      SELECT p.* FROM posts p
+      WHERE p.timestamp > DATE_SUB(NOW(), INTERVAL 7 DAY)
+    `;
+    
+    const params = [];
+    
+    if (viewedArray.length > 0) {
+      const placeholders = viewedArray.map(() => '?').join(',');
+      sql += ` AND p._id NOT IN (${placeholders})`;
+      params.push(...viewedArray);
+    }
+    
+    sql += ` ORDER BY RAND() LIMIT ?`;
+    params.push(count);
 
-  return result.rows.map(post => ({ ...post, feedType: 'random' }));
+    const [rows] = await db.execute(sql, params);
+    return rows.map(post => ({ ...post, feedType: 'random' }));
+  } catch (error) {
+    console.error('Error getting random posts:', error);
+    return [];
+  }
 }
 
 async function getFollowingPosts(db, userData, recentlyViewed, count) {
@@ -250,21 +268,32 @@ async function getFollowingPosts(db, userData, recentlyViewed, count) {
     return await getRandomPosts(db, userData, recentlyViewed, count);
   }
 
-  const viewedFilter = recentlyViewed.size > 0 
-    ? `AND p._id NOT IN (${Array.from(recentlyViewed).map(() => '?').join(',')})` 
-    : '';
-
-  const followingPlaceholders = userData.following.map(() => '?').join(',');
-  
-  const result = await db.execute(`
-    SELECT p.* FROM posts p
-    WHERE p.username IN (${followingPlaceholders})
-    ${viewedFilter}
-    ORDER BY p.timestamp DESC
-    LIMIT ?
-  `, [...userData.following, ...Array.from(recentlyViewed), count]);
-
-  return result.rows.map(post => ({ ...post, feedType: 'following' }));
+  try {
+    const viewedArray = Array.from(recentlyViewed);
+    const followingPlaceholders = userData.following.map(() => '?').join(',');
+    
+    let sql = `
+      SELECT p.* FROM posts p
+      WHERE p.username IN (${followingPlaceholders})
+    `;
+    
+    const params = [...userData.following];
+    
+    if (viewedArray.length > 0) {
+      const viewedPlaceholders = viewedArray.map(() => '?').join(',');
+      sql += ` AND p._id NOT IN (${viewedPlaceholders})`;
+      params.push(...viewedArray);
+    }
+    
+    sql += ` ORDER BY p.timestamp DESC LIMIT ?`;
+    params.push(count);
+    
+    const [rows] = await db.execute(sql, params);
+    return rows.map(post => ({ ...post, feedType: 'following' }));
+  } catch (error) {
+    console.error('Error getting following posts:', error);
+    return await getRandomPosts(db, userData, recentlyViewed, count);
+  }
 }
 
 async function getFriendsPosts(db, userData, recentlyViewed, count) {
@@ -272,94 +301,143 @@ async function getFriendsPosts(db, userData, recentlyViewed, count) {
     return await getRandomPosts(db, userData, recentlyViewed, count);
   }
 
-  const viewedFilter = recentlyViewed.size > 0 
-    ? `AND p._id NOT IN (${Array.from(recentlyViewed).map(() => '?').join(',')})` 
-    : '';
-
-  const friendsPlaceholders = userData.friends.map(() => '?').join(',');
-  
-  const result = await db.execute(`
-    SELECT p.* FROM posts p
-    WHERE p.username IN (${friendsPlaceholders})
-    ${viewedFilter}
-    ORDER BY (p.likes + p.hearts + CHAR_LENGTH(p.comments)) DESC, p.timestamp DESC
-    LIMIT ?
-  `, [...userData.friends, ...Array.from(recentlyViewed), count]);
-
-  return result.rows.map(post => ({ ...post, feedType: 'friends' }));
+  try {
+    const viewedArray = Array.from(recentlyViewed);
+    const friendsPlaceholders = userData.friends.map(() => '?').join(',');
+    
+    let sql = `
+      SELECT p.* FROM posts p
+      WHERE p.username IN (${friendsPlaceholders})
+    `;
+    
+    const params = [...userData.friends];
+    
+    if (viewedArray.length > 0) {
+      const viewedPlaceholders = viewedArray.map(() => '?').join(',');
+      sql += ` AND p._id NOT IN (${viewedPlaceholders})`;
+      params.push(...viewedArray);
+    }
+    
+    sql += ` ORDER BY (p.likes + p.hearts + CHAR_LENGTH(p.comments)) DESC, p.timestamp DESC LIMIT ?`;
+    params.push(count);
+    
+    const [rows] = await db.execute(sql, params);
+    return rows.map(post => ({ ...post, feedType: 'friends' }));
+  } catch (error) {
+    console.error('Error getting friends posts:', error);
+    return await getRandomPosts(db, userData, recentlyViewed, count);
+  }
 }
 
 async function getRegionalPosts(db, userData, recentlyViewed, count) {
   if (count <= 0) return [];
 
-  const viewedFilter = recentlyViewed.size > 0 
-    ? `AND p._id NOT IN (${Array.from(recentlyViewed).map(() => '?').join(',')})` 
-    : '';
-
-  // Try city first, then region, then country
-  let posts = [];
-  
-  // City-level posts
-  if (userData.city && posts.length < count) {
-    const result = await db.execute(`
-      SELECT p.* FROM posts p
-      JOIN users u ON p.username = u.username
-      WHERE u.city = ? AND p.username != ?
-      ${viewedFilter}
-      AND p.timestamp > DATE_SUB(NOW(), INTERVAL 3 DAY)
-      ORDER BY (p.likes + p.hearts) DESC, p.timestamp DESC
-      LIMIT ?
-    `, [userData.city, userData.username, ...Array.from(recentlyViewed), count]);
+  try {
+    const viewedArray = Array.from(recentlyViewed);
+    let posts = [];
     
-    posts.push(...result.rows.map(post => ({ ...post, feedType: 'regional-city' })));
-  }
+    // City-level posts
+    if (userData.city && posts.length < count) {
+      let sql = `
+        SELECT p.* FROM posts p
+        JOIN users u ON p.username = u.username
+        WHERE u.city = ? AND p.username != ?
+        AND p.timestamp > DATE_SUB(NOW(), INTERVAL 3 DAY)
+      `;
+      
+      const params = [userData.city, userData.username];
+      
+      if (viewedArray.length > 0) {
+        const viewedPlaceholders = viewedArray.map(() => '?').join(',');
+        sql += ` AND p._id NOT IN (${viewedPlaceholders})`;
+        params.push(...viewedArray);
+      }
+      
+      sql += ` ORDER BY (p.likes + p.hearts) DESC, p.timestamp DESC LIMIT ?`;
+      params.push(count);
+      
+      const [rows] = await db.execute(sql, params);
+      posts.push(...rows.map(post => ({ ...post, feedType: 'regional-city' })));
+    }
 
-  // Region-level posts if not enough city posts
-  if (userData.region && posts.length < count) {
-    const remaining = count - posts.length;
-    const result = await db.execute(`
-      SELECT p.* FROM posts p
-      JOIN users u ON p.username = u.username
-      WHERE u.region = ? AND p.username != ?
-      ${viewedFilter}
-      AND p._id NOT IN (${posts.length > 0 ? posts.map(() => '?').join(',') : "''"})
-      AND p.timestamp > DATE_SUB(NOW(), INTERVAL 5 DAY)
-      ORDER BY (p.likes + p.hearts) DESC, p.timestamp DESC
-      LIMIT ?
-    `, [userData.region, userData.username, ...Array.from(recentlyViewed), ...(posts.length > 0 ? posts.map(p => p._id) : []), remaining]);
-    
-    posts.push(...result.rows.map(post => ({ ...post, feedType: 'regional-region' })));
-  }
+    // Region-level posts if not enough city posts
+    if (userData.region && posts.length < count) {
+      const remaining = count - posts.length;
+      let sql = `
+        SELECT p.* FROM posts p
+        JOIN users u ON p.username = u.username
+        WHERE u.region = ? AND p.username != ?
+        AND p.timestamp > DATE_SUB(NOW(), INTERVAL 5 DAY)
+      `;
+      
+      const params = [userData.region, userData.username];
+      
+      if (viewedArray.length > 0) {
+        const viewedPlaceholders = viewedArray.map(() => '?').join(',');
+        sql += ` AND p._id NOT IN (${viewedPlaceholders})`;
+        params.push(...viewedArray);
+      }
+      
+      if (posts.length > 0) {
+        const postPlaceholders = posts.map(() => '?').join(',');
+        sql += ` AND p._id NOT IN (${postPlaceholders})`;
+        params.push(...posts.map(p => p._id));
+      }
+      
+      sql += ` ORDER BY (p.likes + p.hearts) DESC, p.timestamp DESC LIMIT ?`;
+      params.push(remaining);
+      
+      const [rows2] = await db.execute(sql, params);
+      posts.push(...rows2.map(post => ({ ...post, feedType: 'regional-region' })));
+    }
 
-  // Country-level posts if still not enough
-  if (userData.country && posts.length < count) {
-    const remaining = count - posts.length;
-    const result = await db.execute(`
-      SELECT p.* FROM posts p
-      JOIN users u ON p.username = u.username
-      WHERE u.country = ? AND p.username != ?
-      ${viewedFilter}
-      AND p._id NOT IN (${posts.length > 0 ? posts.map(() => '?').join(',') : "''"})
-      AND p.timestamp > DATE_SUB(NOW(), INTERVAL 7 DAY)
-      ORDER BY (p.likes + p.hearts) DESC, p.timestamp DESC
-      LIMIT ?
-    `, [userData.country, userData.username, ...Array.from(recentlyViewed), ...(posts.length > 0 ? posts.map(p => p._id) : []), remaining]);
-    
-    posts.push(...result.rows.map(post => ({ ...post, feedType: 'regional-country' })));
-  }
+    // Country-level posts if still not enough
+    if (userData.country && posts.length < count) {
+      const remaining = count - posts.length;
+      let sql = `
+        SELECT p.* FROM posts p
+        JOIN users u ON p.username = u.username
+        WHERE u.country = ? AND p.username != ?
+        AND p.timestamp > DATE_SUB(NOW(), INTERVAL 7 DAY)
+      `;
+      
+      const params = [userData.country, userData.username];
+      
+      if (viewedArray.length > 0) {
+        const viewedPlaceholders = viewedArray.map(() => '?').join(',');
+        sql += ` AND p._id NOT IN (${viewedPlaceholders})`;
+        params.push(...viewedArray);
+      }
+      
+      if (posts.length > 0) {
+        const postPlaceholders = posts.map(() => '?').join(',');
+        sql += ` AND p._id NOT IN (${postPlaceholders})`;
+        params.push(...posts.map(p => p._id));
+      }
+      
+      sql += ` ORDER BY (p.likes + p.hearts) DESC, p.timestamp DESC LIMIT ?`;
+      params.push(remaining);
+      
+      const [rows3] = await db.execute(sql, params);
+      posts.push(...rows3.map(post => ({ ...post, feedType: 'regional-country' })));
+    }
 
-  // Fill with random if still not enough
-  if (posts.length < count) {
-    const additionalRandom = await getRandomPosts(
-      db,
-      userData, 
-      new Set([...recentlyViewed, ...posts.map(p => p._id)]), 
-      count - posts.length
-    );
-    posts.push(...additionalRandom.map(post => ({ ...post, feedType: 'regional-fallback' })));
-  }
+    // Fill with random if still not enough
+    if (posts.length < count) {
+      const additionalRandom = await getRandomPosts(
+        db,
+        userData, 
+        new Set([...recentlyViewed, ...posts.map(p => p._id)]), 
+        count - posts.length
+      );
+      posts.push(...additionalRandom.map(post => ({ ...post, feedType: 'regional-fallback' })));
+    }
 
-  return posts.slice(0, count);
+    return posts.slice(0, count);
+  } catch (error) {
+    console.error('Error getting regional posts:', error);
+    return await getRandomPosts(db, userData, recentlyViewed, count);
+  }
 }
 
 // === UTILITY FUNCTIONS ===
@@ -383,172 +461,207 @@ function getActualComposition(posts) {
 
 // === EXISTING FUNCTIONS ===
 async function handleUserProfile(db, username, headers) {
-  const result = await db.execute(
-    'SELECT username, profile_picture, Music, description, created_at FROM users WHERE username = ?',
-    [username]
-  );
-  
-  if (result.rows.length === 0) {
-    return new Response(JSON.stringify({ message: 'User not found' }), {
-      status: 404,
+  try {
+    const [rows] = await db.execute(
+      'SELECT username, profile_picture, Music, description, created_at FROM users WHERE username = ?',
+      [username]
+    );
+    
+    if (rows.length === 0) {
+      return new Response(JSON.stringify({ message: 'User not found' }), {
+        status: 404,
+        headers: { ...Object.fromEntries(headers), 'Content-Type': 'application/json' }
+      });
+    }
+    
+    const user = rows[0];
+    return new Response(JSON.stringify({
+      username: user.username,
+      profilePicture: user.profile_picture,
+      Music: user.Music || 'Music not available',
+      description: user.description || 'No description available',
+      created_at: user.created_at || 'created_at not available'
+    }), {
+      status: 200,
+      headers: { ...Object.fromEntries(headers), 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Error in user profile:', error);
+    return new Response(JSON.stringify({ error: 'Failed to get user profile', details: error.message }), {
+      status: 500,
       headers: { ...Object.fromEntries(headers), 'Content-Type': 'application/json' }
     });
   }
-  
-  const user = result.rows[0];
-  return new Response(JSON.stringify({
-    username: user.username,
-    profilePicture: user.profile_picture,
-    Music: user.Music || 'Music not available',
-    description: user.description || 'No description available',
-    created_at: user.created_at || 'created_at not available'
-  }), {
-    status: 200,
-    headers: { ...Object.fromEntries(headers), 'Content-Type': 'application/json' }
-  });
 }
 
 async function handleRegularPostsFetch(db, query, headers, defaultPfp) {
-  const {
-    username_like,
-    start_timestamp,
-    end_timestamp,
-    page = 1,
-    limit = 10,
-    sort,
-  } = query;
+  try {
+    const {
+      username_like,
+      start_timestamp,
+      end_timestamp,
+      page = 1,
+      limit = 10,
+      sort,
+    } = query;
 
-  let sql = 'SELECT * FROM posts';
-  const params = [];
-  const offset = (parseInt(page) - 1) * parseInt(limit);
+    let sql = 'SELECT * FROM posts';
+    const params = [];
+    const offset = (parseInt(page) - 1) * parseInt(limit);
 
-  const conditions = [];
+    const conditions = [];
 
-  if (username_like) {
-    conditions.push('username LIKE ?');
-    params.push(`%${username_like}%`);
-  }
+    if (username_like) {
+      conditions.push('username LIKE ?');
+      params.push(`%${username_like}%`);
+    }
 
-  if (start_timestamp && end_timestamp) {
-    conditions.push('timestamp BETWEEN ? AND ?');
-    params.push(start_timestamp, end_timestamp);
-  }
+    if (start_timestamp && end_timestamp) {
+      conditions.push('timestamp BETWEEN ? AND ?');
+      params.push(start_timestamp, end_timestamp);
+    }
 
-  if (sort && ['story_rant', 'sports', 'entertainment', 'news'].includes(sort)) {
-    const categoryMap = {
-      story_rant: 'Story/Rant',
-      sports: 'Sports',
-      entertainment: 'Entertainment',
-      news: 'News',
+    if (sort && ['story_rant', 'sports', 'entertainment', 'news'].includes(sort)) {
+      const categoryMap = {
+        story_rant: 'Story/Rant',
+        sports: 'Sports',
+        entertainment: 'Entertainment',
+        news: 'News',
+      };
+      conditions.push('categories = ?');
+      params.push(categoryMap[sort]);
+    }
+
+    if (conditions.length > 0) {
+      sql += ' WHERE ' + conditions.join(' AND ');
+    }
+
+    const sortOptions = {
+      trending: '(likes + comments_count + IFNULL(hearts, 0)) DESC, timestamp DESC',
+      newest: 'timestamp DESC',
+      general: 'timestamp DESC',
+      story_rant: 'timestamp DESC',
+      sports: 'timestamp DESC',
+      entertainment: 'timestamp DESC',
+      news: 'timestamp DESC',
     };
-    conditions.push('categories = ?');
-    params.push(categoryMap[sort]);
+
+    sql += ` ORDER BY ${sortOptions[sort] || 'timestamp DESC'} LIMIT ? OFFSET ?`;
+    params.push(parseInt(limit), offset);
+
+    const [rows] = await db.execute(sql, params);
+    const posts = rows;
+    const enrichedPosts = await enrichPostsWithUserData(db, posts, defaultPfp);
+
+    // Count total posts matching the filters
+    let countQuery = 'SELECT COUNT(*) AS count FROM posts';
+    if (conditions.length > 0) {
+      countQuery += ' WHERE ' + conditions.join(' AND ');
+    }
+    const countParams = params.slice(0, params.length - 2);
+    const [countRows] = await db.execute(countQuery, countParams);
+
+    return new Response(JSON.stringify({
+      posts: enrichedPosts,
+      hasMorePosts: (page * limit) < countRows[0].count,
+      filterType: sort === 'general' ? 'general' : (sort || 'general'),
+    }), {
+      status: 200,
+      headers: { ...Object.fromEntries(headers), 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Error in regular posts fetch:', error);
+    return new Response(JSON.stringify({ error: 'Failed to fetch posts', details: error.message }), {
+      status: 500,
+      headers: { ...Object.fromEntries(headers), 'Content-Type': 'application/json' }
+    });
   }
-
-  if (conditions.length > 0) {
-    sql += ' WHERE ' + conditions.join(' AND ');
-  }
-
-  const sortOptions = {
-    trending: '(likes + comments_count + IFNULL(hearts, 0)) DESC, timestamp DESC',
-    newest: 'timestamp DESC',
-    general: 'timestamp DESC',
-    story_rant: 'timestamp DESC',
-    sports: 'timestamp DESC',
-    entertainment: 'timestamp DESC',
-    news: 'timestamp DESC',
-  };
-
-  sql += ` ORDER BY ${sortOptions[sort] || 'timestamp DESC'} LIMIT ? OFFSET ?`;
-  params.push(parseInt(limit), offset);
-
-  const result = await db.execute(sql, params);
-  const posts = result.rows;
-  const enrichedPosts = await enrichPostsWithUserData(db, posts, defaultPfp);
-
-  // Count total posts matching the filters
-  let countQuery = 'SELECT COUNT(*) AS count FROM posts';
-  if (conditions.length > 0) {
-    countQuery += ' WHERE ' + conditions.join(' AND ');
-  }
-  const countParams = params.slice(0, params.length - 2);
-  const countResult = await db.execute(countQuery, countParams);
-
-  return new Response(JSON.stringify({
-    posts: enrichedPosts,
-    hasMorePosts: (page * limit) < countResult.rows[0].count,
-    filterType: sort === 'general' ? 'general' : (sort || 'general'),
-  }), {
-    status: 200,
-    headers: { ...Object.fromEntries(headers), 'Content-Type': 'application/json' }
-  });
 }
 
 async function enrichPostsWithUserData(db, posts, defaultPfp) {
   if (posts.length === 0) return [];
 
-  // Get unique usernames from posts only
-  const usernames = [...new Set(posts.map(p => p.username))];
+  try {
+    // Get unique usernames from posts only
+    const usernames = [...new Set(posts.map(p => p.username))];
 
-  // Also get usernames from replyTo if any
-  const replyToUsernames = posts
-    .map(p => {
-      try {
-        const replyTo = p.replyTo ? JSON.parse(p.replyTo) : null;
-        return replyTo?.username;
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
+    // Also get usernames from replyTo if any
+    const replyToUsernames = posts
+      .map(p => {
+        try {
+          const replyTo = p.replyTo ? JSON.parse(p.replyTo) : null;
+          return replyTo?.username;
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
 
-  // Combine usernames from posts and replyTo
-  const allUsernames = [...new Set([...usernames, ...replyToUsernames])];
+    // Combine usernames from posts and replyTo
+    const allUsernames = [...new Set([...usernames, ...replyToUsernames])];
 
-  const usersMap = {};
-  if (allUsernames.length) {
-    const userSql = `SELECT username, profile_picture FROM users WHERE username IN (${allUsernames.map(() => '?').join(',')})`;
-    const result = await db.execute(userSql, allUsernames);
-    const users = result.rows;
+    const usersMap = {};
+    if (allUsernames.length) {
+      const userSql = `SELECT username, profile_picture FROM users WHERE username IN (${allUsernames.map(() => '?').join(',')})`;
+      const [rows] = await db.execute(userSql, allUsernames);
+      const users = rows;
 
-    users.forEach(u => {
-      usersMap[u.username.toLowerCase()] = u.profile_picture?.startsWith('data:image')
-        ? u.profile_picture
-        : u.profile_picture
-        ? `data:image/jpeg;base64,${u.profile_picture}`
-        : defaultPfp;
-    });
-  }
-
-  // Return lightweight post objects for feed view
-  return posts.map(p => {
-    // Enrich replyTo if present
-    let replyToData = null;
-    try {
-      replyToData = p.replyTo ? JSON.parse(p.replyTo) : null;
-      if (replyToData) {
-        replyToData.profilePicture = usersMap[replyToData.username?.toLowerCase()] || defaultPfp;
-      }
-    } catch {
-      replyToData = null;
+      users.forEach(u => {
+        usersMap[u.username.toLowerCase()] = u.profile_picture?.startsWith('data:image')
+          ? u.profile_picture
+          : u.profile_picture
+          ? `data:image/jpeg;base64,${u.profile_picture}`
+          : defaultPfp;
+      });
     }
 
-    return {
+    // Return lightweight post objects for feed view
+    return posts.map(p => {
+      // Enrich replyTo if present
+      let replyToData = null;
+      try {
+        replyToData = p.replyTo ? JSON.parse(p.replyTo) : null;
+        if (replyToData) {
+          replyToData.profilePicture = usersMap[replyToData.username?.toLowerCase()] || defaultPfp;
+        }
+      } catch {
+        replyToData = null;
+      }
+
+      return {
+        _id: p._id,
+        message: p.message,
+        timestamp: p.timestamp,
+        username: p.username,
+        likes: p.likes,
+        likedBy: (p.likedBy && typeof p.likedBy === 'string') ? JSON.parse(p.likedBy) : (p.likedBy || []),
+        commentCount: p.comments_count || 0,
+        photo: p.photo?.startsWith('http') || p.photo?.startsWith('data:image')
+          ? p.photo
+          : p.photo ? `data:image/jpeg;base64,${p.photo.toString('base64')}` : null,
+        profilePicture: usersMap[p.username.toLowerCase()] || defaultPfp,
+        tags: p.tags ? (typeof p.tags === 'string' ? JSON.parse(p.tags) : p.tags) || [] : [],
+        feedType: p.feedType || 'regular',
+        views_count: p.views_count || 0,
+        replyTo: replyToData
+      };
+    });
+  } catch (error) {
+    console.error('Error enriching posts:', error);
+    return posts.map(p => ({
       _id: p._id,
       message: p.message,
       timestamp: p.timestamp,
       username: p.username,
       likes: p.likes,
-      likedBy: (p.likedBy && typeof p.likedBy === 'string') ? JSON.parse(p.likedBy) : (p.likedBy || []),
+      likedBy: [],
       commentCount: p.comments_count || 0,
-      photo: p.photo?.startsWith('http') || p.photo?.startsWith('data:image')
-        ? p.photo
-        : p.photo ? `data:image/jpeg;base64,${p.photo.toString('base64')}` : null,
-      profilePicture: usersMap[p.username.toLowerCase()] || defaultPfp,
-      tags: p.tags ? (typeof p.tags === 'string' ? JSON.parse(p.tags) : p.tags) || [] : [],
+      photo: null,
+      profilePicture: defaultPfp,
+      tags: [],
       feedType: p.feedType || 'regular',
       views_count: p.views_count || 0,
-      replyTo: replyToData
-    };
-  });
+      replyTo: null
+    }));
+  }
 }
