@@ -23,6 +23,8 @@
     "wrangler": "^3.78.0"
   },
   "dependencies": {
-    "mysql2": "^3.11.0"
-  }
+    "@planetscale/database": "^1.18.0"
+  },
+  "node_compat": true
 }
+
